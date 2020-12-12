@@ -57,13 +57,13 @@ enum {
  * Extract the OP code from the skb head.
  *
  * Note: this function assumes that the skb head was pulled enough
- * to access the first byte at the beginning of the data buffer.
+ * to access the first byte after the provided offset.
  *
  * Return the OP code
  */
-static inline u8 ovpn_opcode_from_skb(const struct sk_buff *skb)
+static inline u8 ovpn_opcode_from_skb(const struct sk_buff *skb, u16 offset)
 {
-	return *skb->data >> OVPN_OPCODE_SHIFT;
+	return *(skb->data + offset) >> OVPN_OPCODE_SHIFT;
 }
 
 /**

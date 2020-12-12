@@ -55,10 +55,10 @@ err:
 	return NULL;
 }
 
-/* Here we look at an incoming OpenVPN UDP packet.  If we are able
- * to process it, we will send it directly to tun interface.
- * Otherwise, send it up to userspace.
- * Called in softirq context.
+/**
+ * Start processing a received UDP packet.
+ * If the first byte of the payload is DATA_V2, the packet is further processed,
+ * otherwise it is forwarded to the UDP stack for delivery to user space.
  *
  * Return codes:
  *  0 : we consumed or dropped packet
@@ -67,8 +67,20 @@ err:
  */
 int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 {
+	struct ovpn_peer *peer = NULL;
 	struct ovpn_struct *ovpn;
-	struct ovpn_peer *peer;
+	int ret;
+
+	/* Make sure the first byte of the skb data buffer after the UDP header is accessible.
+	 * It is going to be used to fetch the OP code now and the key ID later
+	 */
+	if (unlikely(!pskb_may_pull(skb, sizeof(struct udphdr) + 1)))
+		return -ENODATA;
+
+	/* only DATA_V2 packets are handled in kernel space, the rest goes to user space */
+	if (unlikely(ovpn_opcode_from_skb(skb, sizeof(struct udphdr)) != OVPN_DATA_V2)) {
+		return 1;
+	}
 
 	/* pop off outer UDP header */
 	__skb_pull(skb, sizeof(struct udphdr));
@@ -81,19 +93,25 @@ int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
 	/* lookup peer */
 	peer = ovpn_lookup_peer_via_transport(ovpn, skb);
-	if (!peer) {
-		pr_err_ratelimited("%s: cannot lookup peer from skb\n", __func__);
+	if (unlikely(!peer)) {
+		pr_debug_ratelimited("%s: packet received from unknown peer\n", __func__);
 		goto drop;
 	}
 
-	if (!ovpn_recv(ovpn, peer, skb)) {
-		pr_err_ratelimited("%s: cannot handle incoming packet\n", __func__);
+	ret = ovpn_recv(ovpn, peer, skb);
+	if (unlikely(ret < 0)) {
+		pr_err_ratelimited("%s: cannot handle incoming packet: %d\n", __func__, ret);
 		goto drop;
 	}
 
-	return 0;
+	/* should this be a non DATA_V2 packet, ret will be >0 and this will instruct the UDP
+	 * stack to continue processing this packet as usual (i.e. deliver to user space)
+	 */
+	return ret;
 
 drop:
+	if (peer)
+		ovpn_peer_put(peer);
 	kfree_skb(skb);
 	return 0;
 }
