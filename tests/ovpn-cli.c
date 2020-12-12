@@ -36,11 +36,6 @@
 
 typedef int (*ovpn_nl_cb)(struct nl_msg *msg, void *arg);
 
-enum ovpn_key_direction {
-	KEY_DIR_IN = 0,
-	KEY_DIR_OUT,
-};
-
 #define KEY_LEN (256 / 8)
 #define NONCE_LEN 8
 
@@ -67,6 +62,7 @@ struct ovpn_ctx {
 		struct sockaddr_in in4;
 		struct sockaddr_in6 in6;
 	} remote;
+	socklen_t socklen;
 
 	unsigned int ifindex;
 
@@ -74,8 +70,6 @@ struct ovpn_ctx {
 
 	__u32 keepalive_interval;
 	__u32 keepalive_timeout;
-
-	enum ovpn_key_direction key_dir;
 };
 
 static int ovpn_nl_recvmsgs(struct nl_ctx *ctx)
@@ -248,11 +242,11 @@ static int ovpn_nl_msg_send(struct nl_ctx *ctx, ovpn_nl_cb cb)
 
 static int ovpn_read_key(const char *file, struct ovpn_ctx *ctx)
 {
-	int idx_enc, idx_dec, ret = -1;
 	unsigned char *ckey = NULL;
 	__u8 *bkey = NULL;
 	size_t olen = 0;
 	long ckey_len;
+	int ret = -1;
 	FILE *fp;
 
 	fp = fopen(file, "r");
@@ -318,20 +312,9 @@ static int ovpn_read_key(const char *file, struct ovpn_ctx *ctx)
 		goto err;
 	}
 
-	switch (ctx->key_dir) {
-	case KEY_DIR_IN:
-		idx_enc = 0;
-		idx_dec = 1;
-		break;
-	case KEY_DIR_OUT:
-		idx_enc = 1;
-		idx_dec = 0;
-		break;
-	}
-
-	memcpy(ctx->key_enc, bkey + KEY_LEN * idx_enc, KEY_LEN);
-	memcpy(ctx->key_dec, bkey + KEY_LEN * idx_dec, KEY_LEN);
-	memcpy(ctx->nonce, bkey + 2 * KEY_LEN, NONCE_LEN);
+	memcpy(ctx->key_enc, bkey, KEY_LEN);
+	memcpy(ctx->key_dec, bkey, KEY_LEN);
+	memcpy(ctx->nonce, bkey, NONCE_LEN);
 
 	ret = 0;
 
@@ -353,25 +336,6 @@ static int ovpn_read_cipher(const char *cipher, struct ovpn_ctx *ctx)
 		ctx->cipher = OVPN_CIPHER_ALG_NONE;
 	else
 		return -ENOTSUP;
-
-	return 0;
-}
-
-static int ovpn_read_key_direction(const char *dir, struct ovpn_ctx *ctx)
-{
-	int in_dir;
-
-	in_dir = strtoll(dir, NULL, 10);
-	switch (in_dir) {
-	case KEY_DIR_IN:
-	case KEY_DIR_OUT:
-		ctx->key_dir = in_dir;
-		break;
-	default:
-		fprintf(stderr,
-			"invalid key direction provided. Can be 0 or 1 only\n");
-		return -1;
-	}
 
 	return 0;
 }
@@ -492,7 +456,6 @@ err:
 
 static int ovpn_connect(struct ovpn_ctx *ovpn)
 {
-	socklen_t socklen;
 	int s, ret;
 
 	s = socket(ovpn->remote.in4.sin_family, SOCK_STREAM, 0);
@@ -501,18 +464,7 @@ static int ovpn_connect(struct ovpn_ctx *ovpn)
 		return -1;
 	}
 
-	switch (ovpn->remote.in4.sin_family) {
-	case AF_INET:
-		socklen = sizeof(struct sockaddr_in);
-		break;
-	case AF_INET6:
-		socklen = sizeof(struct sockaddr_in6);
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-
-	ret = connect(s, (struct sockaddr *)&ovpn->remote, socklen);
+	ret = connect(s, (struct sockaddr *)&ovpn->remote, ovpn->socklen);
 	if (ret < 0) {
 		perror("connect");
 		goto err;
@@ -953,7 +905,7 @@ static void usage(const char *cmd)
 		cmd);
 	fprintf(stderr, "\tiface: tun interface name\n\n");
 
-	fprintf(stderr, "* start_udp <lport>: start UDP-based VPN session on port\n");
+	fprintf(stderr, "* start_udp <lport> <raddr> <rport> <cipher> <key_file>: start UDP-based VPN session on port\n");
 	fprintf(stderr, "\tlocal-port: UDP port to listen to\n\n");
 
 	fprintf(stderr, "* connect <raddr> <rport>: start connecting peer of TCP-based VPN session\n");
@@ -976,11 +928,9 @@ static void usage(const char *cmd)
 		"\tkeepalive_timeout: time after which a peer is timed out\n\n");
 
 	fprintf(stderr,
-		"* new_key <cipher> <key_dir> <key_file>: set data channel key\n");
+		"* new_key <cipher> <key_file>: set data channel key\n");
 	fprintf(stderr,
 		"\tcipher: cipher to use, supported: aes (AES-GCM), chachapoly (CHACHA20POLY1305), none\n");
-	fprintf(stderr,
-		"\tkey_dir: key direction, must 0 on one host and 1 on the other\n");
 	fprintf(stderr, "\tkey_file: file containing the pre-shared key\n\n");
 
 	fprintf(stderr, "* del_key: erase existing data channel key\n\n");
@@ -1014,6 +964,7 @@ static int ovpn_parse_remote(struct ovpn_ctx *ovpn, const char *host, const char
 	}
 
 	memcpy(&ovpn->remote, result->ai_addr, result->ai_addrlen);
+	ovpn->socklen = result->ai_addrlen;
 	ret = 0;
 out:
 	freeaddrinfo(result);
@@ -1074,7 +1025,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (!strcmp(argv[2], "start_udp")) {
-		if (argc < 4) {
+		if (argc < 8) {
 			usage(argv[0]);
 			return -1;
 		}
@@ -1085,8 +1036,19 @@ int main(int argc, char *argv[])
 			return -1;
 		}
 
-		if (argc > 4 && !strcmp(argv[4], "ipv6"))
-			family = AF_INET6;
+		ret = ovpn_parse_remote(&ovpn, argv[4], argv[5]);
+		if (ret < 0)
+			return ret;
+
+		ret = ovpn_read_cipher(argv[6], &ovpn);
+		if (ret < 0)
+			return ret;
+
+		ret = ovpn_read_key(argv[7], &ovpn);
+		if (ret)
+			return ret;
+
+		/* parsing done */
 
 		ret = ovpn_udp_socket(&ovpn, family);
 		if (ret < 0)
@@ -1098,6 +1060,45 @@ int main(int argc, char *argv[])
 			close(ovpn.socket);
 			return ret;
 		}
+
+		ret = ovpn_new_peer(&ovpn);
+		if (ret < 0) {
+			fprintf(stderr, "cannot add peer to VPN\n");
+			close(ovpn.socket);
+			return ret;
+		}
+
+		ret = ovpn_new_key(&ovpn);
+		if (ret < 0) {
+			fprintf(stderr, "cannot set key\n");
+			close(ovpn.socket);
+			return ret;
+		}
+
+		sleep(2);
+
+		const char *msg = "TEST_CONTROL_MESSAGE";
+		ret = sendto(ovpn.socket, msg, strlen(msg) + 1, 0, (struct sockaddr *)&ovpn.remote,
+			     ovpn.socklen);
+		if (ret < 0) {
+			fprintf(stderr, "cannot send ctrl message: %s\n", strerror(-ret));
+			close(ovpn.socket);
+			return ret;
+		}
+
+		char buff[256];
+		ret = recvfrom(ovpn.socket, buff, 255, 0, NULL, NULL);
+		if (ret < 0) {
+			fprintf(stderr, "cannot receive ctrl message: %s\n", strerror(-ret));
+			close(ovpn.socket);
+			return ret;
+		}
+
+		buff[ret] = '\0';
+		fprintf(stderr, "received message: '%s'\n", buff);
+		close(ovpn.socket);
+
+		ret = 0;
 	} else if (!strcmp(argv[2], "listen")) {
 		if (argc < 4) {
 			usage(argv[0]);
@@ -1191,10 +1192,6 @@ int main(int argc, char *argv[])
 		}
 
 		ret = ovpn_read_cipher(argv[3], &ovpn);
-		if (ret < 0)
-			return ret;
-
-		ret = ovpn_read_key_direction(argv[4], &ovpn);
 		if (ret < 0)
 			return ret;
 
